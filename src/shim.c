@@ -64,8 +64,12 @@ static void shim_init(void)
     real_open  = (open_fn)  dlsym(RTLD_NEXT, "PmBtBsaifHidOpenUInput");
     real_send  = (send_fn)  dlsym(RTLD_NEXT, "PmBtBsaifHidSendToInput");
     real_close = (close_fn) dlsym(RTLD_NEXT, "PmBtBsaifHidCloseUInput");
-    shim_log("webos-bt-shim loaded (dump=%d, real open=%p send=%p close=%p)",
-             g_shim_dump, (void *)real_open, (void *)real_send, (void *)real_close);
+    /* LD_PRELOAD is inherited by every child of BluetoothMonitor (incl. its
+     * /bin/sh helpers), but only PmBtEngine actually links libPmBtBsaif.  Stay
+     * quiet elsewhere so the log isn't flooded with meaningless load lines. */
+    if (real_open || real_send || real_close)
+        shim_log("webos-bt-shim loaded (dump=%d, real open=%p send=%p close=%p)",
+                 g_shim_dump, (void *)real_open, (void *)real_send, (void *)real_close);
 }
 
 static struct managed *find(void *dev)
