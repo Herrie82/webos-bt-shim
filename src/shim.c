@@ -43,11 +43,15 @@ typedef void (*open_fn)(void *dev, void *remdev);
 typedef void (*send_fn)(void *dev, void *msg);
 typedef void (*close_fn)(void *dev);
 typedef int  (*passkey_fn)(void *addr, void *pin, unsigned char pinlen);
+typedef int  (*ssp_fn)(int accept, void *addr, unsigned int passkey);
+typedef int  (*getzone_fn)(int zone);
 
 static open_fn    real_open;
 static send_fn    real_send;
 static close_fn   real_close;
 static passkey_fn real_passkey;
+static ssp_fn     real_sspaccept;
+static getzone_fn real_getzone;
 
 #define MAX_MANAGED 8
 struct managed {
@@ -66,10 +70,12 @@ static void shim_init(void)
 {
     const char *d = getenv("WEBOS_BT_SHIM_DUMP");
     g_shim_dump = (d && d[0] == '1');
-    real_open    = (open_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidOpenUInput");
-    real_send    = (send_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidSendToInput");
-    real_close   = (close_fn)   dlsym(RTLD_NEXT, "PmBtBsaifHidCloseUInput");
-    real_passkey = (passkey_fn) dlsym(RTLD_NEXT, "PmBtBsaifPassKey");
+    real_open      = (open_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidOpenUInput");
+    real_send      = (send_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidSendToInput");
+    real_close     = (close_fn)   dlsym(RTLD_NEXT, "PmBtBsaifHidCloseUInput");
+    real_passkey   = (passkey_fn) dlsym(RTLD_NEXT, "PmBtBsaifPassKey");
+    real_sspaccept = (ssp_fn)     dlsym(RTLD_NEXT, "PmBtBsaifSspAccept");
+    real_getzone   = (getzone_fn) dlsym(RTLD_NEXT, "PmBtDbgGetZoneState");
     /* LD_PRELOAD is inherited by every child of BluetoothMonitor (incl. its
      * /bin/sh helpers), but only PmBtEngine actually links libPmBtBsaif.  Stay
      * quiet elsewhere so the log isn't flooded with meaningless load lines. */
@@ -287,4 +293,39 @@ EXPORT int PmBtBsaifPassKey(void *addr, void *pin, unsigned char pinlen)
     }
     if (real_passkey) return real_passkey(addr, pin, pinlen);
     return 0;
+}
+
+/* Interpose the SSP acceptance path.  A Wii Remote Plus does SSP (not legacy
+ * PIN), so the pairing response comes through here rather than PmBtBsaifPassKey.
+ * A Wiimote is no-input/no-output -> the correct association model is Just
+ * Works, so for a Nintendo address we force accept=1.  We also always log which
+ * SSP model + address the stack chose, to see how the negotiation resolved. */
+EXPORT int PmBtBsaifSspAccept(int accept, void *addr, unsigned int passkey)
+{
+    int is_nin = 0;
+    uint8_t written[6];
+
+    if (addr) is_nin = wiimote_is_nintendo((const uint8_t *)addr, written);
+
+    if (addr) {
+        const uint8_t *a = (const uint8_t *)addr;
+        shim_log("SspAccept accept=%d passkey=%u nintendo=%d addr=%02x:%02x:%02x:%02x:%02x:%02x",
+                 accept, passkey, is_nin, a[0],a[1],a[2],a[3],a[4],a[5]);
+    }
+    if (is_nin && !accept) {
+        shim_log("wiimote: forcing SSP accept (Just Works)");
+        accept = 1;
+    }
+    return real_sspaccept ? real_sspaccept(accept, addr, passkey) : 0;
+}
+
+/* Interpose the debug-zone gate.  The security (4) / GAP (3) / HIDH (27) trace
+ * is compiled in but off by default, hiding the pairing negotiation.  In dump
+ * mode, force those zones verbose so bt.log shows the full SSP/authentication
+ * handshake.  Everything else defers to the real zone state. */
+EXPORT int PmBtDbgGetZoneState(int zone)
+{
+    if (g_shim_dump && (zone == 3 || zone == 4 || zone == 0x1b))
+        return 5;                       /* > any "if (N < level)" log threshold */
+    return real_getzone ? real_getzone(zone) : 0;
 }
