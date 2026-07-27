@@ -24,6 +24,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 #include "devinst.h"
 #include "hid_parser.h"
@@ -55,7 +58,39 @@ static passkey_fn     real_passkey;
 static ssp_fn         real_sspaccept;
 static getzone_fn     real_getzone;
 static scpasskey_fn   real_scpasskeyind;
+static scpasskey_fn   real_scssppasskeyind;
 static fromcsraddr_fn p_fromcsraddr;
+
+/* GOT slot offsets (r_offset) of intra-libPmBtBsaif calls we must redirect.
+ * From `readelf -r libPmBtBsaif.so` (webOS 3.0.5 topaz). The old loader binds
+ * these internal PLT calls to the local definition, so LD_PRELOAD symbol
+ * interposition is ignored -- we overwrite the GOT slots at runtime instead. */
+#define GOT_HidOpenUInput     0xe3794
+#define GOT_HidSendToInput    0xe373c
+#define GOT_HidCloseUInput    0xe39f8
+#define GOT_handleScPasskey   0xe3e54
+#define GOT_handleScSspPasskey 0xe3a1c
+
+/* Overwrite one GOT slot at base+offset with newfn, but only if it currently
+ * holds expect_real (guards against a wrong offset corrupting the table). */
+static void got_patch(void *base, unsigned long off, void *expect_real,
+                      void *newfn, const char *name)
+{
+    void **slot = (void **)((char *)base + off);
+    long ps = sysconf(_SC_PAGESIZE);
+    void *page = (void *)((uintptr_t)slot & ~((uintptr_t)ps - 1));
+    if (mprotect(page, ps, PROT_READ | PROT_WRITE) != 0) {
+        shim_log("got_patch %s: mprotect failed", name);
+        return;
+    }
+    /* With lazy binding the slot may still hold the resolver stub (not the real
+     * function) until first call; patching before that is fine -- it just means
+     * the resolver never runs.  Log old vs expected for visibility, patch either
+     * way (the offset is fixed for this exact binary). */
+    shim_log("got_patch %s: slot=%p old=%p expect_real=%p -> %p",
+             name, (void *)slot, *slot, expect_real, newfn);
+    *slot = newfn;
+}
 
 #define MAX_MANAGED 8
 struct managed {
@@ -69,6 +104,14 @@ struct managed {
 static struct managed g_tab[MAX_MANAGED];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* forward decls (our interposers, defined below) so the constructor can take
+ * their addresses for GOT patching */
+void PmBtBsaifHidOpenUInput(void *dev, void *remdev);
+void PmBtBsaifHidSendToInput(void *dev, void *msg);
+void PmBtBsaifHidCloseUInput(void *dev);
+void handleScPasskeyInd(void *msg);
+void handleScSspPasskeyInd(void *msg);
+
 __attribute__((constructor))
 static void shim_init(void)
 {
@@ -80,14 +123,32 @@ static void shim_init(void)
     real_passkey   = (passkey_fn) dlsym(RTLD_NEXT, "PmBtBsaifPassKey");
     real_sspaccept = (ssp_fn)     dlsym(RTLD_NEXT, "PmBtBsaifSspAccept");
     real_getzone   = (getzone_fn) dlsym(RTLD_NEXT, "PmBtDbgGetZoneState");
-    real_scpasskeyind = (scpasskey_fn)   dlsym(RTLD_NEXT,    "handleScPasskeyInd");
-    p_fromcsraddr     = (fromcsraddr_fn) dlsym(RTLD_DEFAULT, "PmBtHelpFromCsrAddrCpy");
-    /* LD_PRELOAD is inherited by every child of BluetoothMonitor (incl. its
-     * /bin/sh helpers), but only PmBtEngine actually links libPmBtBsaif.  Stay
-     * quiet elsewhere so the log isn't flooded with meaningless load lines. */
-    if (real_open || real_send || real_close)
+    real_scpasskeyind    = (scpasskey_fn)   dlsym(RTLD_NEXT, "handleScPasskeyInd");
+    real_scssppasskeyind = (scpasskey_fn)   dlsym(RTLD_NEXT, "handleScSspPasskeyInd");
+    p_fromcsraddr        = (fromcsraddr_fn) dlsym(RTLD_DEFAULT, "PmBtHelpFromCsrAddrCpy");
+
+    if (real_open || real_send || real_close) {
         shim_log("webos-bt-shim loaded (dump=%d, real open=%p send=%p close=%p)",
                  g_shim_dump, (void *)real_open, (void *)real_send, (void *)real_close);
+
+        /* This loader binds libPmBtBsaif's calls to its OWN functions locally,
+         * so LD_PRELOAD can't intercept them.  Overwrite the GOT slots so the
+         * intra-library PLT calls land in our interposers instead. */
+        {
+            Dl_info info;
+            if (dladdr((void *)real_open, &info) && info.dli_fbase) {
+                void *base = info.dli_fbase;
+                shim_log("GOT-patching libPmBtBsaif at base=%p", base);
+                got_patch(base, GOT_HidOpenUInput,  (void *)real_open,  (void *)PmBtBsaifHidOpenUInput,  "HidOpenUInput");
+                got_patch(base, GOT_HidSendToInput, (void *)real_send,  (void *)PmBtBsaifHidSendToInput, "HidSendToInput");
+                got_patch(base, GOT_HidCloseUInput, (void *)real_close, (void *)PmBtBsaifHidCloseUInput, "HidCloseUInput");
+                got_patch(base, GOT_handleScPasskey,    (void *)real_scpasskeyind,    (void *)handleScPasskeyInd,    "handleScPasskeyInd");
+                got_patch(base, GOT_handleScSspPasskey, (void *)real_scssppasskeyind, (void *)handleScSspPasskeyInd, "handleScSspPasskeyInd");
+            } else {
+                shim_log("dladdr failed -- cannot GOT-patch; intra-lib hooks inactive");
+            }
+        }
+    }
 }
 
 static struct managed *find(void *dev)
@@ -346,8 +407,7 @@ EXPORT int PmBtDbgGetZoneState(int zone)
 EXPORT void handleScPasskeyInd(void *msg)
 {
     void *ind = msg ? *(void **)((char *)msg + 4) : 0;
-    shim_dbg("handleScPasskeyInd FIRED msg=%p ind=%p real_passkey=%p",
-             msg, ind, (void *)real_passkey);
+    shim_log("handleScPasskeyInd FIRED msg=%p ind=%p", msg, ind);
 
     if (ind && real_passkey) {
         const uint8_t *p = (const uint8_t *)ind;
@@ -397,4 +457,14 @@ EXPORT void handleScPasskeyInd(void *msg)
         }
     }
     if (real_scpasskeyind) real_scpasskeyind(msg);
+}
+
+/* SSP passkey indication.  The Wii Remote uses legacy PIN (above), but interpose
+ * this too so we can see if any device takes the SSP path here. */
+EXPORT void handleScSspPasskeyInd(void *msg)
+{
+    void *ind = msg ? *(void **)((char *)msg + 4) : 0;
+    shim_log("handleScSspPasskeyInd FIRED msg=%p ind=%p", msg, ind);
+    if (g_shim_dump && ind) shim_hexdump("ssp-passkey-ind", (const unsigned char *)ind, 0x30);
+    if (real_scssppasskeyind) real_scssppasskeyind(msg);
 }
