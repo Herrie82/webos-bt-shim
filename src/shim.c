@@ -45,13 +45,17 @@ typedef void (*close_fn)(void *dev);
 typedef int  (*passkey_fn)(void *addr, void *pin, unsigned char pinlen);
 typedef int  (*ssp_fn)(int accept, void *addr, unsigned int passkey);
 typedef int  (*getzone_fn)(int zone);
+typedef void (*scpasskey_fn)(void *msg);
+typedef void (*fromcsraddr_fn)(void *dst, unsigned int lap, unsigned int uapnap);
 
-static open_fn    real_open;
-static send_fn    real_send;
-static close_fn   real_close;
-static passkey_fn real_passkey;
-static ssp_fn     real_sspaccept;
-static getzone_fn real_getzone;
+static open_fn        real_open;
+static send_fn        real_send;
+static close_fn       real_close;
+static passkey_fn     real_passkey;
+static ssp_fn         real_sspaccept;
+static getzone_fn     real_getzone;
+static scpasskey_fn   real_scpasskeyind;
+static fromcsraddr_fn p_fromcsraddr;
 
 #define MAX_MANAGED 8
 struct managed {
@@ -76,6 +80,8 @@ static void shim_init(void)
     real_passkey   = (passkey_fn) dlsym(RTLD_NEXT, "PmBtBsaifPassKey");
     real_sspaccept = (ssp_fn)     dlsym(RTLD_NEXT, "PmBtBsaifSspAccept");
     real_getzone   = (getzone_fn) dlsym(RTLD_NEXT, "PmBtDbgGetZoneState");
+    real_scpasskeyind = (scpasskey_fn)   dlsym(RTLD_NEXT,    "handleScPasskeyInd");
+    p_fromcsraddr     = (fromcsraddr_fn) dlsym(RTLD_DEFAULT, "PmBtHelpFromCsrAddrCpy");
     /* LD_PRELOAD is inherited by every child of BluetoothMonitor (incl. its
      * /bin/sh helpers), but only PmBtEngine actually links libPmBtBsaif.  Stay
      * quiet elsewhere so the log isn't flooded with meaningless load lines. */
@@ -328,4 +334,38 @@ EXPORT int PmBtDbgGetZoneState(int zone)
     if (g_shim_dump && (zone == 3 || zone == 4 || zone == 0x1b))
         return 5;                       /* > any "if (N < level)" log threshold */
     return real_getzone ? real_getzone(zone) : 0;
+}
+
+/* Interpose the legacy PIN *request* handler.  The stock flow raises a UI dialog
+ * and only sends the PIN after the user types it -- far too slow for a Wii
+ * Remote, whose PIN-request window is short, so bonding fails 0x18 before the
+ * response is ever sent.  Here we answer instantly: for a Nintendo address we
+ * compute the address-derived PIN and send it straight to the stack via
+ * PmBtBsaifPassKey (a direct CsrPutMessage, no engine queue), skipping the
+ * dialog entirely.  Non-Nintendo devices keep the normal flow. */
+EXPORT void handleScPasskeyInd(void *msg)
+{
+    if (msg && p_fromcsraddr && real_passkey) {
+        void *ind = *(void **)((char *)msg + 4);
+        if (ind) {
+            unsigned int lap    = *(unsigned int *)((char *)ind + 8);
+            unsigned int uapnap = *(unsigned int *)((char *)ind + 0xc);
+            uint8_t addr6[8], written[6];
+            memset(addr6, 0, sizeof(addr6));
+            p_fromcsraddr(addr6, lap, uapnap);
+            if (g_shim_dump)
+                shim_dbg("PasskeyInd addr=%02x:%02x:%02x:%02x:%02x:%02x",
+                         addr6[0],addr6[1],addr6[2],addr6[3],addr6[4],addr6[5]);
+            if (wiimote_is_nintendo(addr6, written)) {
+                uint8_t pin[6];
+                wiimote_make_pin(written, pin);
+                shim_log("wiimote: auto-answering legacy PIN for "
+                         "%02x:%02x:%02x:%02x:%02x:%02x (pin=addr-reversed)",
+                         written[0],written[1],written[2],written[3],written[4],written[5]);
+                real_passkey(addr6, pin, 6);
+                return;                 /* answered directly; skip the dialog */
+            }
+        }
+    }
+    if (real_scpasskeyind) real_scpasskeyind(msg);
 }
