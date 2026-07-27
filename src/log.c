@@ -16,9 +16,11 @@ static void ensure_logfile(void)
     const char *path;
     if (tried) return;
     tried = 1;
+    /* Default to a fixed path so logging works even when the process was spawned
+     * without our env (e.g. ls-hubd/dbus activation of PmBtEngine). */
     path = getenv("WEBOS_BT_SHIM_LOG");
-    if (path && *path)
-        g_logfile = fopen(path, "a");
+    if (!path || !*path) path = "/var/log/btshim.log";
+    g_logfile = fopen(path, "a");
 }
 
 static void vout(const char *level, const char *fmt, va_list ap)

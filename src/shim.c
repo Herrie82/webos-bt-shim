@@ -115,8 +115,10 @@ void handleScSspPasskeyInd(void *msg);
 __attribute__((constructor))
 static void shim_init(void)
 {
+    /* Default dump ON (debugging) so it works via ld.so.preload without our env;
+     * WEBOS_BT_SHIM_DUMP=0 disables it. */
     const char *d = getenv("WEBOS_BT_SHIM_DUMP");
-    g_shim_dump = (d && d[0] == '1');
+    g_shim_dump = (d == 0) ? 1 : (d[0] == '1');
     real_open      = (open_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidOpenUInput");
     real_send      = (send_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidSendToInput");
     real_close     = (close_fn)   dlsym(RTLD_NEXT, "PmBtBsaifHidCloseUInput");
@@ -397,6 +399,34 @@ EXPORT int PmBtDbgGetZoneState(int zone)
     return real_getzone ? real_getzone(zone) : 0;
 }
 
+/* The TouchPad's own BD_ADDR (from PmBtStack -X), written order. Used as a PIN
+ * candidate for the sync-button style pairing. */
+static const uint8_t HOST_ADDR[6] = { 0x00, 0x1d, 0xfe, 0x7e, 0x83, 0x05 };
+
+/* Wii Remote legacy-PIN answer.  The correct PIN depends on the model + who
+ * initiated + byte order, and our first guess (Wiimote addr, LSB-first) gets
+ * Authentication Failure 0x5.  Cycle candidates across successive pairing
+ * attempts and log each, so retrying a few times finds the one that
+ * authenticates.  written[] = the Wiimote BD_ADDR in written order. */
+static void wii_answer_pin(const uint8_t written[6])
+{
+    static int attempt = 0;
+    uint8_t pin[6];
+    int v = attempt % 4, i;
+    const char *desc;
+    attempt++;
+    switch (v) {
+    case 0:  for (i=0;i<6;i++) pin[i]=written[5-i];   desc="wiimote-LSBfirst"; break;
+    case 1:  for (i=0;i<6;i++) pin[i]=written[i];     desc="wiimote-MSBfirst"; break;
+    case 2:  for (i=0;i<6;i++) pin[i]=HOST_ADDR[5-i]; desc="host-LSBfirst";    break;
+    default: for (i=0;i<6;i++) pin[i]=HOST_ADDR[i];   desc="host-MSBfirst";    break;
+    }
+    shim_log("wiimote: PIN attempt #%d variant %d (%s) = "
+             "%02x %02x %02x %02x %02x %02x", attempt, v, desc,
+             pin[0],pin[1],pin[2],pin[3],pin[4],pin[5]);
+    if (real_passkey) real_passkey((void *)written, pin, 6);
+}
+
 /* Interpose the legacy PIN *request* handler.  The stock flow raises a UI dialog
  * and only sends the PIN after the user types it -- far too slow for a Wii
  * Remote, whose PIN-request window is short, so bonding fails 0x18 before the
@@ -420,14 +450,9 @@ EXPORT void handleScPasskeyInd(void *msg)
          * orientation) and lock onto the 6 bytes wherever they sit. */
         for (off = 0; off + 6 <= 0x30; off++) {
             if (wiimote_is_nintendo(p + off, written)) {
-                uint8_t pin[6];
-                wiimote_make_pin(written, pin);
-                shim_log("wiimote: found addr at ind+%d = %02x:%02x:%02x:%02x:%02x:%02x; "
-                         "auto-answering legacy PIN instantly", off,
-                         written[0],written[1],written[2],written[3],written[4],written[5]);
-                /* PmBtBsaifPassKey expects the address in written (PmBtStrToAddr)
-                 * order; PIN is that address reversed. */
-                real_passkey(written, pin, 6);
+                shim_log("wiimote: found addr at ind+%d = %02x:%02x:%02x:%02x:%02x:%02x",
+                         off, written[0],written[1],written[2],written[3],written[4],written[5]);
+                wii_answer_pin(written);
                 return;                 /* skip the slow dialog entirely */
             }
         }
@@ -445,12 +470,9 @@ EXPORT void handleScPasskeyInd(void *msg)
                 cand[0] = (nap >> 8) & 0xff; cand[1] = nap & 0xff; cand[2] = uap;
                 cand[3] = (lap >> 16) & 0xff; cand[4] = (lap >> 8) & 0xff; cand[5] = lap & 0xff;
                 if (wiimote_is_nintendo(cand, w2)) {
-                    uint8_t pin[6];
-                    wiimote_make_pin(w2, pin);
-                    shim_log("wiimote: CSR-decoded addr (pack%d) %02x:%02x:%02x:%02x:%02x:%02x; "
-                             "auto-answering PIN", k,
-                             w2[0],w2[1],w2[2],w2[3],w2[4],w2[5]);
-                    real_passkey(w2, pin, 6);
+                    shim_log("wiimote: CSR-decoded addr (pack%d) %02x:%02x:%02x:%02x:%02x:%02x",
+                             k, w2[0],w2[1],w2[2],w2[3],w2[4],w2[5]);
+                    wii_answer_pin(w2);
                     return;
                 }
             }
