@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 #
-# deploy.sh -- install the gamepad/mouse shim onto a novacom-connected TouchPad.
+# deploy.sh -- install/update the shim on a novacom-connected TouchPad.
 #
-# We inject LD_PRELOAD via the *upstart* job that launches BluetoothMonitor,
-# which fork-execs PmBtEngine, so the env is inherited by PmBtEngine while its
-# executable path stays /usr/bin/PmBtEngine.  This matters: ls-hubd binds the
-# com.palm.bluetooth Luna service to that exact path via a role file, so we must
-# NOT rename the binary (an earlier wrapper approach did, and PmBtEngine was then
-# denied its service name -> "Messaging Init failed 0x8100300").
+# Injection: LD_PRELOAD is set in BluetoothMonitor's environment via the upstart
+# job /etc/event.d/bluetooth (it fork-execs PmBtEngine, so the env is inherited
+# while the exe path stays /usr/bin/PmBtEngine -- required for its ls-hubd role).
 #
-# novacom's getopt eats dashed argv, so on-device commands are piped to /bin/sh.
+# IMPORTANT lesson learned: this webOS upstart (0.3.x) does NOT reliably reload a
+# changed /etc/event.d job at runtime (kill -HUP 1 / initctl restart keep the
+# stale in-memory definition, so BluetoothMonitor respawns WITHOUT the env).
+# Only a reboot re-parses the job. Therefore:
+#   * Updating just the .so  -> push it + kill PmBtEngine (BluetoothMonitor, which
+#     already carries the env from boot, respawns PmBtEngine and loads the new .so).
+#     NO reboot, NO monitor restart.
+#   * Changing the upstart job (first install / env change) -> REBOOT to apply.
 #
 # Usage:
-#   scripts/deploy.sh            # install, translator active
-#   scripts/deploy.sh --dump     # also enable WEBOS_BT_SHIM_DUMP=1 logging
+#   scripts/deploy.sh            # update .so (+ ensure job present); reload PmBtEngine
+#   scripts/deploy.sh --setup    # (re)write the upstart job too -> then REBOOT
 #
 set -euo pipefail
-
 NOVACOM="${NOVACOM:-novacom}"
 SO_LOCAL="${SO_LOCAL:-libpmbtgamepad.so}"
 SO_REMOTE=/usr/lib/libpmbtgamepad.so
@@ -24,50 +27,34 @@ JOB=/etc/event.d/bluetooth
 BAK=/etc/event.d/bluetooth.btshim-orig
 LOG=/var/log/btshim.log
 MON=/usr/bin/BluetoothMonitor
-DUMP=0
-[ "${1:-}" = "--dump" ] && DUMP=1
-
+SETUP=0
+[ "${1:-}" = "--setup" ] && SETUP=1
 dev_sh() { $NOVACOM run file://bin/sh; }
 
 [ -f "$SO_LOCAL" ] || { echo "build first: make"; exit 1; }
 
-echo ">> device:"; $NOVACOM -l
-echo ">> remount / read-write"
-echo 'mount -o remount,rw / && echo remounted' | dev_sh
-
-echo ">> push $SO_LOCAL -> $SO_REMOTE"
+echo ">> remount / rw + push $SO_LOCAL"
+echo 'mount -o remount,rw / >/dev/null 2>&1 && echo remounted' | dev_sh
 $NOVACOM put file://"$SO_REMOTE" < "$SO_LOCAL"
 
-echo ">> rewrite upstart job $JOB (backup -> $BAK), dump=$DUMP"
-{
-  echo 'set -e'
-  echo "[ -f $BAK ] || cp $JOB $BAK"
-  echo "cat > $JOB <<'JOBEOF'"
-  echo 'description "Palm Bluetooth"'
-  echo ''
-  echo 'start on stopped finish'
-  echo ''
-  echo 'respawn'
-  if [ "$DUMP" = 1 ]; then
+if [ "$SETUP" = 1 ]; then
+  echo ">> (re)writing upstart job (backup -> $BAK)"
+  {
+    echo "[ -f $BAK ] || cp $JOB $BAK"
+    echo "cat > $JOB <<'JOBEOF'"
+    echo 'description "Palm Bluetooth"'; echo
+    echo 'start on stopped finish'; echo
+    echo 'respawn'
     echo "exec /bin/sh -c 'export LD_PRELOAD=$SO_REMOTE; export WEBOS_BT_SHIM_LOG=$LOG; export WEBOS_BT_SHIM_DUMP=1; exec $MON'"
-  else
-    echo "exec /bin/sh -c 'export LD_PRELOAD=$SO_REMOTE; export WEBOS_BT_SHIM_LOG=$LOG; exec $MON'"
-  fi
-  echo 'JOBEOF'
-  echo 'echo job-written'
-} | dev_sh
+    echo 'JOBEOF'
+    echo 'echo job-written'
+  } | dev_sh
+  echo ">> job written.  REBOOT the device now to apply it:"
+  echo "     $NOVACOM run file://sbin/reboot"
+  exit 0
+fi
 
-echo ">> reload upstart + restart BluetoothMonitor"
-# kill -HUP 1 makes init re-read /etc/event.d (it caches job defs); then a full
-# initctl stop/start cycle respawns BluetoothMonitor with the new exec line.
-# (A bare `killall` respawns from the *cached* old definition -- no env.)
-{
-  echo 'kill -HUP 1 2>/dev/null; sleep 3'
-  echo 'initctl stop bluetooth 2>/dev/null; killall PmBtEngine 2>/dev/null; killall BluetoothMonitor 2>/dev/null; sleep 1'
-  echo 'initctl start bluetooth 2>/dev/null; sleep 3; echo restarted'
-} | dev_sh
-
-echo ">> installed.  log=$LOG  dump=$DUMP"
-echo "   Toggle Bluetooth OFF then ON in Settings, pair a controller, then:"
-echo "   scripts/capture.sh          # tail the dump log"
-echo "   scripts/undeploy.sh         # revert"
+echo ">> reloading: kill PmBtEngine so BluetoothMonitor respawns it with the new .so"
+echo 'rm -f '"$LOG"'; killall PmBtEngine 2>/dev/null; sleep 3; echo done' | dev_sh
+echo ">> checking the shim actually mapped in..."
+echo 'PE=$(pidof PmBtEngine); if grep -q libpmbtgamepad /proc/$PE/maps 2>/dev/null || grep -q loaded '"$LOG"' 2>/dev/null; then echo "OK: shim active"; else echo "NOT LOADED -- BluetoothMonitor lacks the env; run: scripts/deploy.sh --setup  then REBOOT"; fi' | dev_sh
