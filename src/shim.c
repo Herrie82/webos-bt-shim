@@ -57,8 +57,11 @@ static close_fn       real_close;
 static passkey_fn     real_passkey;
 static ssp_fn         real_sspaccept;
 static getzone_fn     real_getzone;
+typedef int  (*debond_fn)(void *addr);
 static scpasskey_fn   real_scpasskeyind;
 static scpasskey_fn   real_scssppasskeyind;
+static scpasskey_fn   real_scbondcfm;
+static debond_fn      p_debond;
 static fromcsraddr_fn p_fromcsraddr;
 
 /* GOT slot offsets (r_offset) of intra-libPmBtBsaif calls we must redirect.
@@ -70,6 +73,7 @@ static fromcsraddr_fn p_fromcsraddr;
 #define GOT_HidCloseUInput    0xe39f8
 #define GOT_handleScPasskey   0xe3e54
 #define GOT_handleScSspPasskey 0xe3a1c
+#define GOT_handleScBondCfm   0xe37c0
 
 /* Overwrite one GOT slot at base+offset with newfn, but only if it currently
  * holds expect_real (guards against a wrong offset corrupting the table). */
@@ -111,6 +115,7 @@ void PmBtBsaifHidSendToInput(void *dev, void *msg);
 void PmBtBsaifHidCloseUInput(void *dev);
 void handleScPasskeyInd(void *msg);
 void handleScSspPasskeyInd(void *msg);
+void handleScBondCfm(void *msg);
 
 __attribute__((constructor))
 static void shim_init(void)
@@ -127,6 +132,8 @@ static void shim_init(void)
     real_getzone   = (getzone_fn) dlsym(RTLD_NEXT, "PmBtDbgGetZoneState");
     real_scpasskeyind    = (scpasskey_fn)   dlsym(RTLD_NEXT, "handleScPasskeyInd");
     real_scssppasskeyind = (scpasskey_fn)   dlsym(RTLD_NEXT, "handleScSspPasskeyInd");
+    real_scbondcfm       = (scpasskey_fn)   dlsym(RTLD_NEXT, "handleScBondCfm");
+    p_debond             = (debond_fn)      dlsym(RTLD_DEFAULT, "PmBtBsaifDebond");
     p_fromcsraddr        = (fromcsraddr_fn) dlsym(RTLD_DEFAULT, "PmBtHelpFromCsrAddrCpy");
 
     if (real_open || real_send || real_close) {
@@ -146,6 +153,7 @@ static void shim_init(void)
                 got_patch(base, GOT_HidCloseUInput, (void *)real_close, (void *)PmBtBsaifHidCloseUInput, "HidCloseUInput");
                 got_patch(base, GOT_handleScPasskey,    (void *)real_scpasskeyind,    (void *)handleScPasskeyInd,    "handleScPasskeyInd");
                 got_patch(base, GOT_handleScSspPasskey, (void *)real_scssppasskeyind, (void *)handleScSspPasskeyInd, "handleScSspPasskeyInd");
+                got_patch(base, GOT_handleScBondCfm,    (void *)real_scbondcfm,       (void *)handleScBondCfm,       "handleScBondCfm");
             } else {
                 shim_log("dladdr failed -- cannot GOT-patch; intra-lib hooks inactive");
             }
@@ -399,6 +407,32 @@ EXPORT int PmBtDbgGetZoneState(int zone)
     return real_getzone ? real_getzone(zone) : 0;
 }
 
+/* Locate a Nintendo BD_ADDR inside a CSR indication struct: try a contiguous
+ * 6-byte scan first, then the CSR-encoded form (lap@a, uap/nap@b) at the offset
+ * pairs the passkey-ind (8,0xc) and bond-cfm (0xc,0x10) use.  Fills written[]. */
+static int find_nintendo(const uint8_t *p, int len, uint8_t written[6])
+{
+    static const int pairs[][2] = { {8, 0xc}, {0xc, 0x10} };
+    int off; unsigned pi;
+    for (off = 0; off + 6 <= len; off++)
+        if (wiimote_is_nintendo(p + off, written)) return 1;
+    for (pi = 0; pi < 2; pi++) {
+        uint32_t a = *(uint32_t *)(p + pairs[pi][0]);
+        uint32_t b = *(uint32_t *)(p + pairs[pi][1]);
+        uint32_t lap = a & 0xffffff;
+        int k;
+        for (k = 0; k < 2; k++) {
+            uint8_t cand[6];
+            uint32_t uap = b & 0xff;
+            uint32_t nap = (k == 0) ? ((b >> 8) & 0xffff) : ((b >> 16) & 0xffff);
+            cand[0]=(nap>>8)&0xff; cand[1]=nap&0xff; cand[2]=uap;
+            cand[3]=(lap>>16)&0xff; cand[4]=(lap>>8)&0xff; cand[5]=lap&0xff;
+            if (wiimote_is_nintendo(cand, written)) return 1;
+        }
+    }
+    return 0;
+}
+
 /* The TouchPad's own BD_ADDR (from PmBtStack -X), written order. Used as a PIN
  * candidate for the sync-button style pairing. */
 static const uint8_t HOST_ADDR[6] = { 0x00, 0x1d, 0xfe, 0x7e, 0x83, 0x05 };
@@ -440,45 +474,43 @@ EXPORT void handleScPasskeyInd(void *msg)
     shim_log("handleScPasskeyInd FIRED msg=%p ind=%p", msg, ind);
 
     if (ind && real_passkey) {
-        const uint8_t *p = (const uint8_t *)ind;
         uint8_t written[6];
-        int off;
-        if (g_shim_dump) shim_hexdump("passkey-ind", p, 0x30);
-
-        /* The BD_ADDR is embedded in the indication struct in some CSR-specific
-         * layout; rather than hardcode it, scan for a Nintendo OUI (either byte
-         * orientation) and lock onto the 6 bytes wherever they sit. */
-        for (off = 0; off + 6 <= 0x30; off++) {
-            if (wiimote_is_nintendo(p + off, written)) {
-                shim_log("wiimote: found addr at ind+%d = %02x:%02x:%02x:%02x:%02x:%02x",
-                         off, written[0],written[1],written[2],written[3],written[4],written[5]);
-                wii_answer_pin(written);
-                return;                 /* skip the slow dialog entirely */
-            }
-        }
-
-        /* Fallback: address may be stored CSR-encoded (lap u24 + uap + nap) at
-         * ind+8 / ind+0xc, not as 6 contiguous bytes.  Try both packings. */
-        {
-            uint32_t a = *(uint32_t *)(p + 8), b = *(uint32_t *)(p + 0xc);
-            uint32_t lap = a & 0xffffff, uap, nap;
-            int k;
-            for (k = 0; k < 2; k++) {
-                uint8_t cand[6], w2[6];
-                if (k == 0) { uap = b & 0xff; nap = (b >> 8)  & 0xffff; }
-                else        { uap = b & 0xff; nap = (b >> 16) & 0xffff; }
-                cand[0] = (nap >> 8) & 0xff; cand[1] = nap & 0xff; cand[2] = uap;
-                cand[3] = (lap >> 16) & 0xff; cand[4] = (lap >> 8) & 0xff; cand[5] = lap & 0xff;
-                if (wiimote_is_nintendo(cand, w2)) {
-                    shim_log("wiimote: CSR-decoded addr (pack%d) %02x:%02x:%02x:%02x:%02x:%02x",
-                             k, w2[0],w2[1],w2[2],w2[3],w2[4],w2[5]);
-                    wii_answer_pin(w2);
-                    return;
-                }
-            }
+        if (g_shim_dump) shim_hexdump("passkey-ind", (const unsigned char *)ind, 0x30);
+        if (find_nintendo((const uint8_t *)ind, 0x30, written)) {
+            shim_log("wiimote: passkey-ind for %02x:%02x:%02x:%02x:%02x:%02x",
+                     written[0],written[1],written[2],written[3],written[4],written[5]);
+            wii_answer_pin(written);
+            return;                     /* skip the slow dialog entirely */
         }
     }
     if (real_scpasskeyind) real_scpasskeyind(msg);
+}
+
+/* Bond confirm.  A failed bond leaves a stale/bad link key cached, so the next
+ * pairing re-authenticates with it and fails 0x5 instantly -- no fresh PIN
+ * request, which blocks our PIN cycling.  When a bond to a Nintendo device
+ * FAILS, forget it (PmBtBsaifDebond) so the next attempt starts clean and the
+ * next PIN candidate is tried. */
+EXPORT void handleScBondCfm(void *msg)
+{
+    void *ind = msg ? *(void **)((char *)msg + 4) : 0;
+    if (ind && p_debond) {
+        const uint8_t *p = (const uint8_t *)ind;
+        uint16_t result = *(uint16_t *)(p + 2);   /* 0 = success */
+        uint8_t written[6];
+        if (find_nintendo(p, 0x30, written)) {
+            shim_log("handleScBondCfm: Nintendo %02x:%02x:%02x:%02x:%02x:%02x result=0x%x",
+                     written[0],written[1],written[2],written[3],written[4],written[5], result);
+            if (result != 0) {
+                if (real_scbondcfm) real_scbondcfm(msg);   /* report failure normally */
+                shim_log("wiimote: bond failed -> debonding to clear cached key");
+                p_debond(written);
+                return;
+            }
+            shim_log("wiimote: bond SUCCEEDED");
+        }
+    }
+    if (real_scbondcfm) real_scbondcfm(msg);
 }
 
 /* SSP passkey indication.  The Wii Remote uses legacy PIN (above), but interpose
