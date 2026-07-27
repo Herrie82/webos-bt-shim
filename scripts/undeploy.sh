@@ -3,18 +3,12 @@
 set -euo pipefail
 NOVACOM="${NOVACOM:-novacom}"
 BIN=/usr/bin/PmBtEngine
+dev_sh() { $NOVACOM run file://bin/sh; }
 
-echo ">> remount / read-write"
-$NOVACOM run file://bin/mount "-o" "remount,rw" "/"
-
-echo ">> restore original binary"
-$NOVACOM run file://bin/sh "-c" \
-  "[ -f ${BIN}.real ] && mv -f ${BIN}.real ${BIN} || echo 'nothing to restore'"
-
-echo ">> remove shim"
-$NOVACOM run file://bin/rm "-f" "/usr/lib/libpmbtgamepad.so"
-
-echo ">> restart Bluetooth"
-$NOVACOM run file://usr/bin/killall "PmBtEngine" || true
-
+{
+  echo 'mount -o remount,rw / >/dev/null 2>&1'
+  echo "[ -f ${BIN}.real ] && mv -f ${BIN}.real ${BIN} && echo restored || echo 'nothing to restore'"
+  echo 'rm -f /usr/lib/libpmbtgamepad.so && echo shim-removed'
+  echo 'killall PmBtEngine 2>/dev/null; echo bt-restarted'
+} | dev_sh
 echo ">> reverted."
