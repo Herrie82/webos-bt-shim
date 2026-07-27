@@ -9,7 +9,8 @@ CC      = $(CROSS)gcc
 
 TARGET  = libpmbtgamepad.so
 SRCDIR  = src
-OBJS    = $(SRCDIR)/shim.o $(SRCDIR)/hid_parser.o $(SRCDIR)/uinput_dev.o $(SRCDIR)/log.o
+OBJS    = $(SRCDIR)/shim.o $(SRCDIR)/hid_parser.o $(SRCDIR)/uinput_dev.o \
+          $(SRCDIR)/wiimote.o $(SRCDIR)/log.o
 
 CFLAGS  = -std=gnu99 -O2 -fPIC -Wall -Wextra -fvisibility=hidden \
           -march=armv7-a -marm

@@ -28,6 +28,7 @@
 #include "devinst.h"
 #include "hid_parser.h"
 #include "uinput_dev.h"
+#include "wiimote.h"
 #include "log.h"
 
 /* remote-device info block offsets (param_2 of OpenUInput) */
@@ -41,16 +42,20 @@
 typedef void (*open_fn)(void *dev, void *remdev);
 typedef void (*send_fn)(void *dev, void *msg);
 typedef void (*close_fn)(void *dev);
+typedef int  (*passkey_fn)(void *addr, void *pin, unsigned char pinlen);
 
-static open_fn  real_open;
-static send_fn  real_send;
-static close_fn real_close;
+static open_fn    real_open;
+static send_fn    real_send;
+static close_fn   real_close;
+static passkey_fn real_passkey;
 
 #define MAX_MANAGED 8
 struct managed {
     void *dev;
     int   fd;
     int   active;
+    int   is_wiimote;
+    int   handle;
     struct hid_profile prof;
 };
 static struct managed g_tab[MAX_MANAGED];
@@ -61,9 +66,10 @@ static void shim_init(void)
 {
     const char *d = getenv("WEBOS_BT_SHIM_DUMP");
     g_shim_dump = (d && d[0] == '1');
-    real_open  = (open_fn)  dlsym(RTLD_NEXT, "PmBtBsaifHidOpenUInput");
-    real_send  = (send_fn)  dlsym(RTLD_NEXT, "PmBtBsaifHidSendToInput");
-    real_close = (close_fn) dlsym(RTLD_NEXT, "PmBtBsaifHidCloseUInput");
+    real_open    = (open_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidOpenUInput");
+    real_send    = (send_fn)    dlsym(RTLD_NEXT, "PmBtBsaifHidSendToInput");
+    real_close   = (close_fn)   dlsym(RTLD_NEXT, "PmBtBsaifHidCloseUInput");
+    real_passkey = (passkey_fn) dlsym(RTLD_NEXT, "PmBtBsaifPassKey");
     /* LD_PRELOAD is inherited by every child of BluetoothMonitor (incl. its
      * /bin/sh helpers), but only PmBtEngine actually links libPmBtBsaif.  Stay
      * quiet elsewhere so the log isn't flooded with meaningless load lines. */
@@ -109,12 +115,42 @@ EXPORT void PmBtBsaifHidOpenUInput(void *dev, void *remdev)
 
     desclen = U16(dev, DEV_RDESC_LEN);
     desc    = FIELD(dev, DEV_RDESC);
+    name    = (const char *)FIELD(remdev, REMDEV_NAME);
 
     if (g_shim_dump) {
-        shim_dbg("OpenUInput dev=%p subclass=0x%02x rdesc_len=%u",
-                 dev, U8(dev, DEV_SUBCLASS), desclen);
+        const uint8_t *bd = FIELD(dev, DEV_BDADDR);
+        shim_dbg("OpenUInput dev=%p name='%s' bd=%02x:%02x:%02x:%02x:%02x:%02x "
+                 "subclass=0x%02x id=%u rdesc_len=%u", dev, name,
+                 bd[0],bd[1],bd[2],bd[3],bd[4],bd[5],
+                 U8(dev, DEV_SUBCLASS), U8(dev, DEV_ID), desclen);
         if (desclen > 0 && desclen <= DEV_RDESC_MAX)
             shim_hexdump("report-descriptor", desc, desclen);
+    }
+
+    /* ---- Wii Remote: dedicated path (custom protocol, not standard HID) ---- */
+    {
+        uint8_t written[6];
+        if (wiimote_name_matches(name) ||
+            wiimote_is_nintendo(FIELD(dev, DEV_BDADDR), written)) {
+            int handle = U8(dev, DEV_ID);
+            int wfd = wiimote_create_uinput(name,
+                          U16(remdev, REMDEV_VENDOR), U16(remdev, REMDEV_PRODUCT));
+            if (wfd < 0) { if (real_open) real_open(dev, remdev); return; }
+
+            pthread_mutex_lock(&g_lock);
+            m = find(dev);
+            if (m) { uinput_destroy(m->fd); m->active = 0; }
+            m = alloc_slot(dev);
+            if (m) { m->fd = wfd; m->is_wiimote = 1; m->handle = handle; }
+            pthread_mutex_unlock(&g_lock);
+            if (!m) { uinput_destroy(wfd); return; }
+
+            U8(dev, DEV_UINPUT_FLAG) = 1;
+            U32(dev, DEV_UINPUT_FD)  = (uint32_t)wfd;
+            shim_log("took over dev=%p as Wii Remote (fd=%d handle=%d)", dev, wfd, handle);
+            wiimote_start_reporting(handle);
+            return;
+        }
     }
 
     /* No usable descriptor -> let the stock keyboard path handle it. */
@@ -197,8 +233,10 @@ EXPORT void PmBtBsaifHidSendToInput(void *dev, void *msg)
     pthread_mutex_unlock(&g_lock);
 
     if (m) {
-        if (rtype == REPORT_TYPE_INPUT && rptr && rlen)
-            uinput_emit_report(m->fd, &m->prof, rptr, rlen);
+        if (rtype == REPORT_TYPE_INPUT && rptr && rlen) {
+            if (m->is_wiimote) wiimote_decode(m->fd, rptr, rlen);
+            else               uinput_emit_report(m->fd, &m->prof, rptr, rlen);
+        }
         return;                       /* managed: never fall through to stock */
     }
 
@@ -223,4 +261,30 @@ EXPORT void PmBtBsaifHidCloseUInput(void *dev)
     pthread_mutex_unlock(&g_lock);
 
     if (real_close) real_close(dev);
+}
+
+/* Interpose the legacy PIN response.  A Wii Remote paired via 1+2 wants a PIN
+ * equal to its own BD_ADDR reversed -- 6 raw bytes that can't be typed into the
+ * pairing dialog.  When we see a Nintendo address here, substitute the correct
+ * PIN (the user can type any dummy value in the dialog).  Everything else is
+ * passed through untouched. */
+EXPORT int PmBtBsaifPassKey(void *addr, void *pin, unsigned char pinlen)
+{
+    uint8_t written[6];
+
+    if (g_shim_dump && addr) {
+        const uint8_t *a = (const uint8_t *)addr;
+        shim_dbg("PassKey addr=%02x:%02x:%02x:%02x:%02x:%02x pinlen=%u",
+                 a[0],a[1],a[2],a[3],a[4],a[5], pinlen);
+    }
+
+    if (addr && wiimote_is_nintendo((const uint8_t *)addr, written)) {
+        uint8_t wpin[6];
+        wiimote_make_pin(written, wpin);
+        shim_log("wiimote: injecting PIN for %02x:%02x:%02x:%02x:%02x:%02x",
+                 written[0],written[1],written[2],written[3],written[4],written[5]);
+        if (real_passkey) return real_passkey(addr, wpin, 6);
+    }
+    if (real_passkey) return real_passkey(addr, pin, pinlen);
+    return 0;
 }
