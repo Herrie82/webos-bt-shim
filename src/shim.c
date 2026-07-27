@@ -445,15 +445,20 @@ static const uint8_t HOST_ADDR[6] = { 0x00, 0x1d, 0xfe, 0x7e, 0x83, 0x05 };
 static void wii_answer_pin(const uint8_t written[6])
 {
     static int attempt = 0;
+    /* Order matters: attempt #1 is the only one free of debond interference, so
+     * put the most-likely candidate first.  webOS does a persistent bond =
+     * sync-button semantics -> HOST address, LSB-first (per WiiBrew).  The 1+2
+     * candidate (wiimote addr, LSB-first) already got a clean auth-fail 0x5. */
+    static const int order[4] = { 2, 0, 3, 1 };
     uint8_t pin[6];
-    int v = attempt % 4, i;
+    int v = order[attempt % 4], i;
     const char *desc;
     attempt++;
     switch (v) {
-    case 0:  for (i=0;i<6;i++) pin[i]=written[5-i];   desc="wiimote-LSBfirst"; break;
-    case 1:  for (i=0;i<6;i++) pin[i]=written[i];     desc="wiimote-MSBfirst"; break;
-    case 2:  for (i=0;i<6;i++) pin[i]=HOST_ADDR[5-i]; desc="host-LSBfirst";    break;
-    default: for (i=0;i<6;i++) pin[i]=HOST_ADDR[i];   desc="host-MSBfirst";    break;
+    case 0:  for (i=0;i<6;i++) pin[i]=written[5-i];   desc="wiimote-LSBfirst(1+2)"; break;
+    case 1:  for (i=0;i<6;i++) pin[i]=written[i];     desc="wiimote-MSBfirst";      break;
+    case 2:  for (i=0;i<6;i++) pin[i]=HOST_ADDR[5-i]; desc="host-LSBfirst(sync)";   break;
+    default: for (i=0;i<6;i++) pin[i]=HOST_ADDR[i];   desc="host-MSBfirst";         break;
     }
     shim_log("wiimote: PIN attempt #%d variant %d (%s) = "
              "%02x %02x %02x %02x %02x %02x", attempt, v, desc,
