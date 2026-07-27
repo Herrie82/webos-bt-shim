@@ -445,11 +445,9 @@ static const uint8_t HOST_ADDR[6] = { 0x00, 0x1d, 0xfe, 0x7e, 0x83, 0x05 };
 static void wii_answer_pin(const uint8_t written[6])
 {
     static int attempt = 0;
-    /* Order matters: attempt #1 is the only one free of debond interference, so
-     * put the most-likely candidate first.  webOS does a persistent bond =
-     * sync-button semantics -> HOST address, LSB-first (per WiiBrew).  The 1+2
-     * candidate (wiimote addr, LSB-first) already got a clean auth-fail 0x5. */
-    static const int order[4] = { 2, 0, 3, 1 };
+    /* Order: wiimote-addr LSB-first first (the 1+2 PIN, works on an original
+     * RVL-CNT-01), then the host-addr (sync-button) candidates. */
+    static const int order[4] = { 0, 2, 3, 1 };
     uint8_t pin[6];
     int v = order[attempt % 4], i;
     const char *desc;
