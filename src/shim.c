@@ -345,25 +345,54 @@ EXPORT int PmBtDbgGetZoneState(int zone)
  * dialog entirely.  Non-Nintendo devices keep the normal flow. */
 EXPORT void handleScPasskeyInd(void *msg)
 {
-    if (msg && p_fromcsraddr && real_passkey) {
-        void *ind = *(void **)((char *)msg + 4);
-        if (ind) {
-            unsigned int lap    = *(unsigned int *)((char *)ind + 8);
-            unsigned int uapnap = *(unsigned int *)((char *)ind + 0xc);
-            uint8_t addr6[8], written[6];
-            memset(addr6, 0, sizeof(addr6));
-            p_fromcsraddr(addr6, lap, uapnap);
-            if (g_shim_dump)
-                shim_dbg("PasskeyInd addr=%02x:%02x:%02x:%02x:%02x:%02x",
-                         addr6[0],addr6[1],addr6[2],addr6[3],addr6[4],addr6[5]);
-            if (wiimote_is_nintendo(addr6, written)) {
+    void *ind = msg ? *(void **)((char *)msg + 4) : 0;
+    shim_dbg("handleScPasskeyInd FIRED msg=%p ind=%p real_passkey=%p",
+             msg, ind, (void *)real_passkey);
+
+    if (ind && real_passkey) {
+        const uint8_t *p = (const uint8_t *)ind;
+        uint8_t written[6];
+        int off;
+        if (g_shim_dump) shim_hexdump("passkey-ind", p, 0x30);
+
+        /* The BD_ADDR is embedded in the indication struct in some CSR-specific
+         * layout; rather than hardcode it, scan for a Nintendo OUI (either byte
+         * orientation) and lock onto the 6 bytes wherever they sit. */
+        for (off = 0; off + 6 <= 0x30; off++) {
+            if (wiimote_is_nintendo(p + off, written)) {
                 uint8_t pin[6];
                 wiimote_make_pin(written, pin);
-                shim_log("wiimote: auto-answering legacy PIN for "
-                         "%02x:%02x:%02x:%02x:%02x:%02x (pin=addr-reversed)",
+                shim_log("wiimote: found addr at ind+%d = %02x:%02x:%02x:%02x:%02x:%02x; "
+                         "auto-answering legacy PIN instantly", off,
                          written[0],written[1],written[2],written[3],written[4],written[5]);
-                real_passkey(addr6, pin, 6);
-                return;                 /* answered directly; skip the dialog */
+                /* PmBtBsaifPassKey expects the address in written (PmBtStrToAddr)
+                 * order; PIN is that address reversed. */
+                real_passkey(written, pin, 6);
+                return;                 /* skip the slow dialog entirely */
+            }
+        }
+
+        /* Fallback: address may be stored CSR-encoded (lap u24 + uap + nap) at
+         * ind+8 / ind+0xc, not as 6 contiguous bytes.  Try both packings. */
+        {
+            uint32_t a = *(uint32_t *)(p + 8), b = *(uint32_t *)(p + 0xc);
+            uint32_t lap = a & 0xffffff, uap, nap;
+            int k;
+            for (k = 0; k < 2; k++) {
+                uint8_t cand[6], w2[6];
+                if (k == 0) { uap = b & 0xff; nap = (b >> 8)  & 0xffff; }
+                else        { uap = b & 0xff; nap = (b >> 16) & 0xffff; }
+                cand[0] = (nap >> 8) & 0xff; cand[1] = nap & 0xff; cand[2] = uap;
+                cand[3] = (lap >> 16) & 0xff; cand[4] = (lap >> 8) & 0xff; cand[5] = lap & 0xff;
+                if (wiimote_is_nintendo(cand, w2)) {
+                    uint8_t pin[6];
+                    wiimote_make_pin(w2, pin);
+                    shim_log("wiimote: CSR-decoded addr (pack%d) %02x:%02x:%02x:%02x:%02x:%02x; "
+                             "auto-answering PIN", k,
+                             w2[0],w2[1],w2[2],w2[3],w2[4],w2[5]);
+                    real_passkey(w2, pin, 6);
+                    return;
+                }
             }
         }
     }
